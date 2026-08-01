@@ -1,0 +1,4 @@
+*.bak
+*.db
+*.sqlite
+*.log
