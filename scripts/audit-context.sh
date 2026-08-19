@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# audit-context.sh — Diagnostico de contexto acumulado en agentes CLI.
-# SOLO LECTURA. No modifica ni borra nada.
+# audit-context.sh — Forensic audit & token FinOps diagnostic for AI agent CLIs.
+# READ-ONLY. Does not modify or delete any user files.
 #
-# Uso: bash audit-context.sh
+# Usage:
+#   bash audit-context.sh
 
 set -uo pipefail
 
-TURN_ALARM=800          # turnos en una sesion
-SIZE_ALARM=$((20*1024*1024))  # 20 MB por archivo de sesion
+TURN_ALARM=800                # alarm threshold for turns per session
+SIZE_ALARM=$((20*1024*1024))  # 20 MB threshold per session file
 FOUND=0
 ALARMS=0
+ESTIMATED_TOKENS=0
 
-hr() { printf '%.0s-' {1..60}; echo; }
+hr() { printf '%.0s-' {1..64}; echo; }
 alarm() { echo "  [!] $1"; ALARMS=$((ALARMS+1)); }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -24,32 +26,36 @@ human() {
 }
 
 echo
-echo "AUDITORIA DE CONTEXTO — $(date '+%Y-%m-%d %H:%M')"
-echo "Host: $(hostname)"
+echo "================================================================"
+echo "          CONTEXT DISCIPLINE & TOKEN FINOPS AUDIT               "
+echo "================================================================"
+echo "Date: $(date '+%Y-%m-%d %H:%M:%S') | Host: $(hostname)"
 hr
 
 # ---------------------------------------------------------------- Claude Code
 if [ -d "$HOME/.claude/projects" ]; then
   FOUND=1
-  echo "CLAUDE CODE"
-  echo "  Proyectos por tamano:"
+  echo "📦 CLAUDE CODE (Anthropic)"
+  echo "  Projects by footprint:"
   du -sh "$HOME"/.claude/projects/* 2>/dev/null | sort -h | tail -8 | sed 's/^/    /'
 
-  # Sesion desde $HOME (sin raiz de proyecto)
+  # Root directory session check
   HOMEDIR="$HOME/.claude/projects/$(echo "$HOME" | tr '/' '-')"
   if [ -d "$HOMEDIR" ]; then
     SZ=$(du -sb "$HOMEDIR" 2>/dev/null | cut -f1)
-    alarm "Hay sesiones arrancadas desde \$HOME ($(human "${SZ:-0}"))"
+    alarm "Root session detected in \$HOME ($(human "${SZ:-0}")) — high token blast radius!"
     echo "      -> $HOMEDIR"
   fi
 
-  echo "  Sesiones individuales mas pesadas:"
+  echo "  Heaviest individual sessions:"
   while IFS=$'\t' read -r sz path; do
     [ -n "${path:-}" ] || continue
     turns=$(wc -l < "$path" 2>/dev/null || echo 0)
-    printf '    %-6s %6s turnos  %s\n' "$(human "$sz")" "$turns" "$(basename "$path")"
+    # Estimate ~500 tokens per turn avg in raw JSONL
+    ESTIMATED_TOKENS=$((ESTIMATED_TOKENS + turns * 500))
+    printf '    %-6s %6s turns   %s\n' "$(human "$sz")" "$turns" "$(basename "$path")"
     if [ "$turns" -gt "$TURN_ALARM" ] || [ "$sz" -gt "$SIZE_ALARM" ]; then
-      alarm "Sesion inflada: $(basename "$path") — archivar y arrancar limpio"
+      alarm "Bloated session: $(basename "$path") ($turns turns, $(human "$sz")) — archive to restore speed"
       echo "      -> $path"
     fi
   done < <(find "$HOME/.claude/projects" -maxdepth 2 -name "*.jsonl" -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -5)
@@ -60,34 +66,34 @@ fi
 OC_DB="$HOME/.local/share/opencode/opencode.db"
 if [ -f "$OC_DB" ]; then
   FOUND=1
-  echo "OPENCODE"
-  echo "  DB: $(human "$(stat -c%s "$OC_DB")")"
+  echo "⚡ OPENCODE (SST / CLI)"
+  echo "  Database: $(human "$(stat -c%s "$OC_DB")")"
   WAL="${OC_DB}-wal"
-  [ -f "$WAL" ] && echo "  WAL: $(human "$(stat -c%s "$WAL")")"
+  [ -f "$WAL" ] && echo "  WAL size: $(human "$(stat -c%s "$WAL")")"
 
   if have sqlite3; then
-    echo "  Top sesiones por cache read:"
+    echo "  Top sessions by cached token read:"
     while IFS='|' read -r dir cr cost msgs; do
       [ -n "${dir:-}" ] || continue
-      printf '    %-36s %5s M  %-8s %5s msgs\n' "$dir" "$cr" "$cost" "$msgs"
-      [ "${msgs:-0}" -gt "$TURN_ALARM" ] && alarm "Sesion inflada en OpenCode: $dir ($msgs msgs)"
+      printf '    %-36s %5s M tokens  \$%-6s %5s msgs\n' "$dir" "$cr" "$cost" "$msgs"
+      [ "${msgs:-0}" -gt "$TURN_ALARM" ] && alarm "Bloated session in OpenCode: $dir ($msgs msgs)"
     done < <(sqlite3 -separator '|' "$OC_DB" "
-      SELECT substr(directory,-34), tokens_cache_read/1000000,
+      SELECT substr(directory,-34), ROUND(tokens_cache_read/1000000.0, 1),
              ROUND(cost,2),
              (SELECT COUNT(*) FROM message m WHERE m.session_id=s.id)
       FROM session s ORDER BY tokens_cache_read DESC LIMIT 6;" 2>/dev/null)
 
     HOMESESS=$(sqlite3 "$OC_DB" \
       "SELECT COUNT(*) FROM session WHERE directory='$HOME';" 2>/dev/null || echo 0)
-    [ "${HOMESESS:-0}" -gt 0 ] && alarm "$HOMESESS sesion(es) de OpenCode arrancadas desde \$HOME"
+    [ "${HOMESESS:-0}" -gt 0 ] && alarm "$HOMESESS OpenCode session(s) started from \$HOME"
   else
-    alarm "sqlite3 no instalado — no se puede inspeccionar (sudo apt install sqlite3)"
+    alarm "sqlite3 not installed — run: sudo apt install sqlite3"
   fi
 
   TO="$HOME/.local/share/opencode/tool-output"
   if [ -d "$TO" ]; then
     BIG=$(find "$TO" -type f -size +50k 2>/dev/null | wc -l)
-    [ "$BIG" -gt 0 ] && alarm "$BIG salidas de herramienta >50KB — candidatas a volcado al contexto"
+    [ "$BIG" -gt 0 ] && alarm "$BIG tool outputs >50KB — potential context flooding"
   fi
   hr
 fi
@@ -95,14 +101,14 @@ fi
 # ----------------------------------------------------------------------- Codex
 if [ -d "$HOME/.codex" ]; then
   FOUND=1
-  echo "CODEX"
+  echo "🤖 OPENAI CODEX CLI"
   for f in "$HOME"/.codex/*.sqlite; do
     [ -f "$f" ] || continue
     printf '    %-22s %s\n' "$(basename "$f")" "$(human "$(stat -c%s "$f")")"
     w="${f}-wal"
     if [ -f "$w" ]; then
       wsz=$(stat -c%s "$w")
-      [ "$wsz" -gt 20971520 ] && alarm "WAL de $(basename "$f") en $(human "$wsz") sin checkpoint"
+      [ "$wsz" -gt 20971520 ] && alarm "WAL of $(basename "$f") is $(human "$wsz") without checkpoint"
     fi
   done
   [ -d "$HOME/.codex/sessions" ] && echo "    sessions/  $(du -sh "$HOME/.codex/sessions" 2>/dev/null | cut -f1)"
@@ -114,7 +120,7 @@ fi
 AGY="$HOME/.gemini/antigravity-cli"
 if [ -d "$AGY" ]; then
   FOUND=1
-  echo "AGY / ANTIGRAVITY"
+  echo "🪐 ANTIGRAVITY / AGY (Google DeepMind)"
   for d in brain knowledge conversations; do
     [ -d "$AGY/$d" ] && printf '    %-16s %s\n' "$d/" "$(du -sh "$AGY/$d" 2>/dev/null | cut -f1)"
   done
@@ -123,36 +129,47 @@ if [ -d "$AGY" ]; then
   hr
 fi
 
-# ------------------------------------------------------- Reglas desplegadas
-echo "REGLAS DE DISCIPLINA"
+# ------------------------------------------------------- IDE Workspaces
+if [ -d "$HOME/.cursor" ] || [ -d "$HOME/.codeium/windsurf" ]; then
+  echo "💻 IDE WORKSPACES"
+  [ -d "$HOME/.cursor" ] && echo "    Cursor cache:   $(du -sh "$HOME/.cursor" 2>/dev/null | cut -f1)"
+  [ -d "$HOME/.codeium/windsurf" ] && echo "    Windsurf cache: $(du -sh "$HOME/.codeium/windsurf" 2>/dev/null | cut -f1)"
+  hr
+fi
+
+# ------------------------------------------------------- Deployed Rules Check
+echo "🛡️ CONTEXT DISCIPLINE GOVERNANCE"
 check_rule() {
   local label=$1 path=$2
   if [ -e "$path" ] && grep -qi "disciplina de contexto\|context discipline" "$path" 2>/dev/null; then
-    echo "    [ok]  $label"
+    echo "    [ACTIVE]   $label ($path)"
   elif [ -e "$path" ]; then
-    echo "    [--]  $label — existe pero sin las reglas"
+    echo "    [INACTIVE] $label — file exists but missing context discipline headers"
   else
-    echo "    [--]  $label — ausente"
+    echo "    [MISSING]  $label — no configuration file found"
   fi
 }
 check_rule "Claude Code" "$HOME/.claude/CLAUDE.md"
 check_rule "OpenCode"    "$HOME/.config/opencode/AGENTS.md"
 check_rule "Codex"       "$HOME/.codex/AGENTS.md"
-check_rule "agy"         "$HOME/.gemini/config/rules/context-discipline.md"
+check_rule "Antigravity" "$HOME/.gemini/config/rules/context-discipline.md"
 hr
 
-# ------------------------------------------------------------------- Resumen
+# ------------------------------------------------------------------- Summary
 if [ "$FOUND" -eq 0 ]; then
-  echo "No se detecto ningun agente CLI conocido en este equipo."
+  echo "No known AI agent CLI installations detected on this machine."
   exit 0
 fi
 
-echo "RESUMEN: $ALARMS alarma(s)"
+echo "📊 AUDIT SUMMARY: $ALARMS alarm(s) triggered"
 echo
+
 if [ "$ALARMS" -gt 0 ]; then
-  echo "Siguiente paso: revisar cada alarma con el usuario ANTES de tocar nada."
-  echo "Archivar (mv) es preferible a borrar. Respaldar los .db antes de un DELETE."
+  echo "🚨 ACTION REQUIRED:"
+  echo "  1. Archive overgrown session logs (.jsonl / sqlite) to recover sub-second speed."
+  echo "  2. Deploy context rules using: bash scripts/inject-discipline-rules.sh global"
+  echo "  3. Enforce: 'Command output >100 lines -> redirect to disk; report only line count'."
 else
-  echo "Sin alarmas. Verificar el uso real con /usage dentro de Claude Code."
+  echo "✅ HEALTHY: All agent environments follow compact token discipline."
 fi
 echo
